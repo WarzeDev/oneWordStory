@@ -1,0 +1,19 @@
+{
+  "name": "story-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A Discord bot that lets users write a story one word at a time, rendered as an image.",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.65",
+    "discord.js": "^14.16.3"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}
