@@ -23,10 +23,17 @@ When the story is done, any contributor can run `/endstory` and the whole story 
 
 ## 📜 How it works
 
-1. An admin runs `/setchannel #story` and optionally `/setminusers 2`.
-2. The first person types a word. The bot deletes the message and posts the story card.
-3. Everyone keeps adding words. The card updates in place each time.
-4. Any user who has contributed at least one word can run `/endstory`. The card is replaced by the finished book.
+1. An admin runs `/setchannel #story`. The bot posts a hint that the **next message will become the title**.
+2. The first person to post in the channel sets the **title** — it may contain multiple words. Their avatar appears next to the title on the live card.
+3. Everyone keeps adding **one word per message**. The card updates in place each time.
+4. Any user who has contributed (title author included) can run `/endstory`. The live card is replaced by the finished book, which is **pinned** to the channel. The contributor bar at the bottom of the book shows each author's avatar, pastel color, and share of the words.
+5. The next message in the channel starts a **new story** — beginning with a fresh title.
+
+### The title
+
+- The **very first message** in the story channel becomes the title of the book. It may be several words (up to 80 characters) — punctuation counts.
+- The title author's avatar appears next to the title on the live story card. In the finished book, the title is rendered in large serif letters at the top with no avatar.
+- The title counts as a contribution for the `/endstory` rule and shows up in the contributor bar.
 
 ### The "min users" rule
 

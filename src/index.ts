@@ -11,17 +11,39 @@ import {
   type TextChannel,
 } from "discord.js";
 
-import { canContribute, colorFor, getState, type GuildState } from "./store";
-import { renderBookImage, renderStoryImage, type RenderWord } from "./render";
+import {
+  canContribute,
+  colorFor,
+  forget,
+  getContributors,
+  getState,
+  persist,
+  recordWord,
+  resetStory,
+  setTitle,
+  type GuildState,
+  type StoryWord,
+} from "./store";
+import {
+  renderBookImage,
+  renderStoryImage,
+  type RenderContributor,
+  type RenderWord,
+} from "./render";
 
 const TOKEN = process.env.TOKEN;
 if (!TOKEN) {
-  console.error("✖ Missing TOKEN. Copy .env.example to .env and set your bot token.");
+  console.error("Missing TOKEN. Copy .env.example to .env and set your bot token.");
   process.exit(1);
 }
 
 const MAX_WORD_LENGTH = 50;
+const MAX_TITLE_LENGTH = 80;
 const NOTICE_TTL_MS = 6_000;
+const WORD_COOLDOWN_MS = 3_000; // 3 seconds cooldown
+
+// Track the last word timestamp per guild in memory (or store it in GuildState if supported)
+const lastWordTimestamps = new Map<string, number>();
 
 /* ------------------------------------------------------------------ */
 /* Client                                                              */
@@ -42,9 +64,7 @@ const client = new Client({
 const commandData = [
   new SlashCommandBuilder()
     .setName("setminusers")
-    .setDescription(
-      "How many other users must add a word before the same user can go again",
-    )
+    .setDescription("How many other users must add a word before the same user can go again")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addIntegerOption((opt) =>
       opt
@@ -70,6 +90,10 @@ const commandData = [
   new SlashCommandBuilder()
     .setName("endstory")
     .setDescription("Finish the story and render it as a book (contributors only)"),
+
+  new SlashCommandBuilder()
+    .setName("help")
+    .setDescription("How to use Story Bot"),
 ].map((command) => command.toJSON());
 
 /* ------------------------------------------------------------------ */
@@ -81,14 +105,11 @@ const queues = new Map<string, Promise<unknown>>();
 function enqueue(guildId: string, task: () => Promise<void>): void {
   const previous = queues.get(guildId) ?? Promise.resolve();
   const next = previous.then(task, task);
-  queues.set(guildId, next.then(
-    () => undefined,
-    () => undefined,
-  ));
+  queues.set(guildId, next.then(() => undefined, () => undefined));
 }
 
 /* ------------------------------------------------------------------ */
-/* Rendering the bot's story message                                   */
+/* Rendering helpers                                                   */
 /* ------------------------------------------------------------------ */
 
 function toRenderWords(guildState: GuildState): RenderWord[] {
@@ -99,93 +120,126 @@ function toRenderWords(guildState: GuildState): RenderWord[] {
   }));
 }
 
-/**
- * Updates (or posts) the live story card in the configured channel.
- */
-async function updateStoryMessage(guildState: GuildState): Promise<void> {
-  if (!guildState.channelId) return;
+function toRenderTitle(guildState: GuildState) {
+  if (!guildState.title) return null;
+  return {
+    text: guildState.title.text,
+    avatarUrl: guildState.title.authorAvatar,
+  };
+}
 
+function toRenderContributors(guildState: GuildState): RenderContributor[] {
+  return getContributors(guildState.guildId).map((c) => ({
+    color: colorFor(guildState, c.userId),
+    avatarUrl: c.avatarUrl,
+    wordCount: c.wordCount,
+  }));
+}
+
+async function resolveStoryChannel(
+  guildState: GuildState,
+): Promise<TextChannel | null> {
+  if (!guildState.channelId) return null;
   const channel = (await client.channels
     .fetch(guildState.channelId)
     .catch(() => null)) as TextChannel | null;
+  if (!channel || !channel.isTextBased()) return null;
+  return channel;
+}
 
-  if (!channel || !channel.isTextBased()) return;
+async function updateStoryMessage(guildState: GuildState): Promise<void> {
+  const channel = await resolveStoryChannel(guildState);
+  if (!channel) return;
 
-  const buffer = await renderStoryImage(toRenderWords(guildState));
+  const buffer = await renderStoryImage(
+    toRenderTitle(guildState),
+    toRenderWords(guildState),
+  );
   const attachment = new AttachmentBuilder(buffer, { name: "story.png" });
+
+  const content = guildState.title
+    ? "Add **one word** at a time!"
+    : "The next message will become the **title** (it may contain **multiple words**)!";
 
   if (guildState.messageId) {
     try {
       const existing = await channel.messages.fetch(guildState.messageId);
-      await existing.edit({ files: [attachment] });
+      await existing.edit({ content, files: [attachment] });
       return;
     } catch {
-      guildState.messageId = null; // message was deleted — repost below
+      guildState.messageId = null;
+      persist(guildState);
     }
   }
 
-  const posted = await channel.send({ files: [attachment] });
+  const posted = await channel.send({ content, files: [attachment] });
   guildState.messageId = posted.id;
+  persist(guildState);
 }
 
-/**
- * Renders the finished book as a *standalone* message so it is not
- * overwritten when the next story begins, then resets the story state
- * so users can start writing a new one right away.
- */
+async function announceTitlePrompt(channel: TextChannel): Promise<void> {
+  await notify(
+    channel,
+    "**A new story begins!** The **next message** in this channel will become the book's **title** - it may contain multiple words. After that, one word per message.",
+    15_000,
+  );
+}
+
 async function finishStory(guildState: GuildState): Promise<void> {
-  if (!guildState.channelId) return;
+  const channel = await resolveStoryChannel(guildState);
+  if (!channel) return;
 
-  const channel = (await client.channels
-    .fetch(guildState.channelId)
-    .catch(() => null)) as TextChannel | null;
+  const title = toRenderTitle(guildState);
+  const words = toRenderWords(guildState);
+  const contributors = toRenderContributors(guildState);
 
-  if (!channel || !channel.isTextBased()) return;
-
-  // 1. Delete the live story card — it's about to be replaced by the
-  //    permanent book message, and the old card would otherwise linger
-  //    as an orphaned preview of a story that no longer exists.
   if (guildState.messageId) {
     try {
       const existing = await channel.messages.fetch(guildState.messageId);
       await existing.delete();
     } catch {
-      /* already gone — fine */
+      /* already gone */
     }
     guildState.messageId = null;
+    persist(guildState);
   }
 
-  // 2. Post the finished book as its own message.
-  const book = renderBookImage(toRenderWords(guildState));
-  await channel.send({
+  const book = await renderBookImage(title, words, contributors);
+  const message = await channel.send({
+    content: title
+      ? `**${title.text}** - a new story begins with the next word!`
+      : "**The End** - a new story begins with the next word!",
     files: [new AttachmentBuilder(book, { name: "story-book.png" })],
   });
 
-  // 3. Reset everything except the channel + settings.
-  guildState.words = [];
-  guildState.order = [];
-  guildState.ended = false;
-  // colors stay cached — they're per-user, not per-story
+  try {
+    await message.pin("Story completed");
+  } catch (error) {
+    console.warn(
+      `Could not pin story in guild ${guildState.guildId}:`,
+      (error as Error).message,
+    );
+  }
+
+  resetStory(guildState);
+  lastWordTimestamps.delete(guildState.guildId); // Reset cooldown on story finish
+  await announceTitlePrompt(channel);
 }
 
-/* ------------------------------------------------------------------ */
-/* Small self-deleting notices                                         */
-/* ------------------------------------------------------------------ */
-
-async function notify(channel: TextChannel, text: string): Promise<void> {
+async function notify(
+  channel: TextChannel,
+  text: string,
+  ttl = NOTICE_TTL_MS,
+): Promise<void> {
   try {
     const notice = await channel.send(text);
     setTimeout(() => {
       notice.delete().catch(() => {});
-    }, NOTICE_TTL_MS);
+    }, ttl);
   } catch {
-    /* the channel may be read-only — ignore */
+    /* ignore */
   }
 }
-
-/* ------------------------------------------------------------------ */
-/* Ready                                                               */
-/* ------------------------------------------------------------------ */
 
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`✔ Logged in as ${readyClient.user.tag}`);
@@ -197,9 +251,10 @@ client.once(Events.ClientReady, async (readyClient) => {
   }
 });
 
-/* ------------------------------------------------------------------ */
-/* Interactions                                                        */
-/* ------------------------------------------------------------------ */
+client.on(Events.GuildDelete, (guild) => {
+  forget(guild.id);
+  lastWordTimestamps.delete(guild.id);
+});
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || !interaction.guildId) return;
@@ -211,6 +266,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   try {
     switch (interaction.commandName) {
+      case "help": {
+        await interaction.reply({
+          flags: MessageFlags.Ephemeral,
+          content:
+            "**📖 book.Warze.org**\n" +
+            "A collaborative story written one word per message.\n\n" +
+            "**Admin setup**\n" +
+            "• `/setchannel <channel>` — choose the story channel\n" +
+            "• `/setminusers <num>` — how many *other* users must write before a user can go again (`0` = no restriction)\n\n" +
+            "**How to write**\n" +
+            "• The first message in the channel becomes the **title** (it may contain multiple words).\n" +
+            "• After that, **one word per message** with a **3-second cooldown** between words.\n" +
+            "• Your messages are deleted and folded into the story image.\n\n" +
+            "**Finish**\n" +
+            "• `/endstory` — anyone who contributed can close the book. The finished book is pinned; the next message starts a new story.",
+        });
+        return;
+      }
+
       case "setminusers": {
         if (!isAdmin) {
           await interaction.reply({
@@ -222,11 +296,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const num = interaction.options.getInteger("num", true);
         guildState.minUsers = num;
+        persist(guildState);
 
         await interaction.reply({
           content:
             num === 0
-              ? "✅ Minimum users set to **0** - users can now write back-to-back."
+              ? "✅ Minimum users set to **0** — users can now write back-to-back."
               : `✅ Each user must wait for **${num}** other user${
                   num === 1 ? "" : "s"
                 } to write before adding another word.`,
@@ -245,13 +320,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const channel = interaction.options.getChannel("channel", true);
+        const target = (await client.channels
+          .fetch(channel.id)
+          .catch(() => null)) as TextChannel | null;
+
+        if (!target || !target.isTextBased()) {
+          await interaction.reply({
+            content: "That channel isn't a text channel I can see.",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const me = interaction.guild?.members.me;
+        const perms = me ? target.permissionsFor(me) : null;
+        if (
+          !perms?.has(PermissionFlagsBits.SendMessages) ||
+          !perms?.has(PermissionFlagsBits.AttachFiles) ||
+          !perms?.has(PermissionFlagsBits.ManageMessages)
+        ) {
+          await interaction.reply({
+            content:
+              "I need **Send Messages**, **Attach Files**, and **Manage Messages** in that channel.",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
         guildState.channelId = channel.id;
-        guildState.messageId = null; // post a fresh story card in the new channel
+        guildState.messageId = null;
+        persist(guildState);
 
         await interaction.reply({
           content: `✅ Story channel set to <#${channel.id}>.`,
           flags: MessageFlags.Ephemeral,
         });
+        await announceTitlePrompt(target);
         return;
       }
 
@@ -264,7 +368,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (guildState.words.length === 0) {
+        if (guildState.words.length === 0 && !guildState.title) {
           await interaction.reply({
             content: "The story is empty.",
             flags: MessageFlags.Ephemeral,
@@ -272,9 +376,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const contributed = guildState.words.some(
-          (word) => word.userId === interaction.user.id,
-        );
+        const contributed =
+          guildState.title?.authorId === interaction.user.id ||
+          guildState.words.some((w) => w.userId === interaction.user.id);
         if (!contributed) {
           await interaction.reply({
             content: "You haven't added a word to this story yet.",
@@ -284,17 +388,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        guildState.ended = true;
 
+        let alreadyEnded = false;
         await new Promise<void>((resolve) => {
           enqueue(interaction.guildId!, async () => {
+            if (guildState.ended) {
+              alreadyEnded = true;
+              resolve();
+              return;
+            }
+            guildState.ended = true;
+            persist(guildState);
             await finishStory(guildState);
             resolve();
           });
         });
 
+        if (alreadyEnded) {
+          await interaction.editReply("This story has already ended.");
+          return;
+        }
+
         await interaction.editReply(
-          "You have ended the story.",
+          "The story has been bound into a book and pinned. The next message will become the **title** of a new story.",
         );
         return;
       }
@@ -313,7 +429,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Word collection                                                     */
+/* Word collection (and title capture)                                 */
 /* ------------------------------------------------------------------ */
 
 client.on(Events.MessageCreate, async (message: Message) => {
@@ -322,31 +438,68 @@ client.on(Events.MessageCreate, async (message: Message) => {
   const guildState = getState(message.guild.id);
   if (!guildState.channelId) return;
   if (message.channelId !== guildState.channelId) return;
-  // Note: no `ended` guard here — the story auto-restarts after /endstory.
+  if (guildState.ended) return;
 
   const channel = message.channel as TextChannel;
   const raw = message.content.trim();
   const parts = raw.split(/\s+/).filter(Boolean);
+  const userId = message.author.id;
 
-  // Attachments / empty messages: silently clear them out.
   if (parts.length === 0) {
     await message.delete().catch(() => {});
     return;
   }
 
-  const isSingleWord = parts.length === 1 && raw.length <= MAX_WORD_LENGTH;
-  const userId = message.author.id;
-
-  // The story channel is a canvas, not a chat — always remove the message.
   await message.delete().catch(() => {});
 
   enqueue(message.guild.id, async () => {
+    if (guildState.ended) return;
+
+    // ---- Title phase (No cooldown needed for title) ----
+    if (!guildState.titleSet) {
+      const titleText = raw;
+      if (titleText.length > MAX_TITLE_LENGTH) {
+        await notify(
+          channel,
+          `Titles can be at most ${MAX_TITLE_LENGTH} characters.`,
+        );
+        return;
+      }
+
+      const author = message.author;
+      setTitle(guildState, {
+        text: titleText,
+        authorId: userId,
+        authorName: author.username,
+        authorAvatar: author.displayAvatarURL({ size: 64, extension: "png" }),
+      });
+
+      await updateStoryMessage(guildState);
+      return;
+    }
+
+    // ---- Cooldown Check ----
+    const now = Date.now();
+    const lastTime = lastWordTimestamps.get(message.guild.id) ?? 0;
+    const elapsed = now - lastTime;
+
+    if (elapsed < WORD_COOLDOWN_MS) {
+      const remainingSecs = ((WORD_COOLDOWN_MS - elapsed) / 1000).toFixed(1);
+      await notify(
+        channel,
+        `Please wait **${remainingSecs}s** before adding another word.`,
+      );
+      return;
+    }
+
+    // ---- Normal word phase ----
+    const isSingleWord = parts.length === 1 && raw.length <= MAX_WORD_LENGTH;
     if (!isSingleWord) {
       await notify(
         channel,
         parts.length > 1
-          ? "✍️ One word at a time, please!"
-          : `✍️ Words can be at most ${MAX_WORD_LENGTH} characters.`,
+          ? "One word at a time."
+          : `Words can be at most ${MAX_WORD_LENGTH} characters.`,
       );
       return;
     }
@@ -354,20 +507,26 @@ client.on(Events.MessageCreate, async (message: Message) => {
     if (!canContribute(guildState, userId)) {
       await notify(
         channel,
-        `⏳ Wait for **${guildState.minUsers}** other user${
+        `Wait for **${guildState.minUsers}** other user${
           guildState.minUsers === 1 ? "" : "s"
         } to add a word before yours.`,
       );
       return;
     }
 
-    guildState.words.push({
-      text: parts[0],
+    // Update last word timestamp successfully
+    lastWordTimestamps.set(message.guild.id, Date.now());
+
+    const word: StoryWord = {
+      text: parts[0]!,
       userId,
       username: message.author.username,
-      avatarUrl: message.author.displayAvatarURL({ size: 64, extension: "png" }),
-    });
-    guildState.order.push(userId);
+      avatarUrl: message.author.displayAvatarURL({
+        size: 64,
+        extension: "png",
+      }),
+    };
+    recordWord(guildState, word);
 
     await updateStoryMessage(guildState);
   });

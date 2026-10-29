@@ -1,46 +1,100 @@
 import { pastelFor } from "./colors";
+import {
+  clearContributions,
+  deleteGuild,
+  incrementContribution,
+  loadContributions,
+  loadGuild,
+  saveGuild,
+  type GuildRow,
+  type StoredWord,
+} from "./db";
 
-export interface StoryWord {
+export type StoryWord = StoredWord;
+
+export interface TitleInfo {
   text: string;
-  userId: string;
-  username: string;
-  avatarUrl: string;
+  authorId: string;
+  authorName: string;
+  authorAvatar: string;
 }
 
 export interface GuildState {
-  /** Channel the story is being written in. */
+  guildId: string;
   channelId: string | null;
-  /** How many *other* users must contribute before a user may go again. */
-  minUsers: number;
-  /** Words of the story, in order. */
-  words: StoryWord[];
-  /** User IDs in the order they contributed (repeats allowed). */
-  order: string[];
-  /** Per-user pastel color, assigned lazily. */
-  colors: Map<string, string>;
-  /** ID of the bot message that displays the rendered story. */
   messageId: string | null;
-  /** True once /endstory has been used. */
+  minUsers: number;
+  title: TitleInfo | null;
+  words: StoryWord[];
+  order: string[];
   ended: boolean;
+  /** Per-user pastel color, assigned lazily (in-memory only — colors are stable). */
+  colors: Map<string, string>;
+  /** True once a user has set the title for the current story. */
+  titleSet: boolean;
 }
 
-const states = new Map<string, GuildState>();
+const cache = new Map<string, GuildState>();
+
+function fromRow(row: GuildRow): GuildState {
+  const words = JSON.parse(row.words) as StoryWord[];
+  const order = JSON.parse(row.order) as string[];
+  const title: TitleInfo | null =
+    row.title && row.title_author_id && row.title_author_name && row.title_author_avatar
+      ? {
+          text: row.title,
+          authorId: row.title_author_id,
+          authorName: row.title_author_name,
+          authorAvatar: row.title_author_avatar,
+        }
+      : null;
+
+  return {
+    guildId: row.guild_id,
+    channelId: row.channel_id,
+    messageId: row.message_id,
+    minUsers: row.min_users,
+    title,
+    words,
+    order,
+    ended: row.ended === 1,
+    colors: new Map(),
+    titleSet: title !== null,
+  };
+}
+
+function toRow(state: GuildState): GuildRow {
+  return {
+    guild_id: state.guildId,
+    channel_id: state.channelId,
+    message_id: state.messageId,
+    min_users: state.minUsers,
+    title: state.title?.text ?? null,
+    title_author_id: state.title?.authorId ?? null,
+    title_author_name: state.title?.authorName ?? null,
+    title_author_avatar: state.title?.authorAvatar ?? null,
+    words: JSON.stringify(state.words),
+    order: JSON.stringify(state.order),
+    ended: state.ended ? 1 : 0,
+  };
+}
 
 export function getState(guildId: string): GuildState {
-  let state = states.get(guildId);
+  let state = cache.get(guildId);
   if (!state) {
-    state = {
-      channelId: null,
-      minUsers: 0,
-      words: [],
-      order: [],
-      colors: new Map(),
-      messageId: null,
-      ended: false,
-    };
-    states.set(guildId, state);
+    state = fromRow(loadGuild(guildId));
+    cache.set(guildId, state);
   }
   return state;
+}
+
+export function persist(state: GuildState): void {
+  saveGuild(toRow(state));
+}
+
+export function forget(guildId: string): void {
+  cache.delete(guildId);
+  deleteGuild(guildId);
 }
 
 export function colorFor(state: GuildState, userId: string): string {
@@ -56,8 +110,8 @@ export function colorFor(state: GuildState, userId: string): string {
  * A user may contribute when at least `minUsers` *distinct other* users have
  * written a word since their own last word.
  *
- * - The very first word of a story is always allowed.
- * - If `minUsers` is 0, the same user can write back-to-back.
+ * The title counts as a contribution for the purpose of the fairness rule:
+ * once the title is set, the title author is in `order` as well.
  */
 export function canContribute(state: GuildState, userId: string): boolean {
   if (state.order.length === 0) return true;
@@ -67,4 +121,64 @@ export function canContribute(state: GuildState, userId: string): boolean {
   const others = new Set(since.filter((id) => id !== userId)).size;
 
   return others >= state.minUsers;
+}
+
+/* ------------------------------------------------------------------ */
+/* Mutations that persist + update contributions                       */
+/* ------------------------------------------------------------------ */
+
+export function recordWord(
+  state: GuildState,
+  word: StoryWord,
+): void {
+  state.words.push(word);
+  state.order.push(word.userId);
+  incrementContribution(
+    state.guildId,
+    word.userId,
+    word.username,
+    word.avatarUrl,
+  );
+  persist(state);
+}
+
+export function setTitle(state: GuildState, title: TitleInfo): void {
+  state.title = title;
+  state.titleSet = true;
+  // Title author counts as a contributor for the fairness rule and the bar.
+  state.order.push(title.authorId);
+  incrementContribution(
+    state.guildId,
+    title.authorId,
+    title.authorName,
+    title.authorAvatar,
+  );
+  persist(state);
+}
+
+export function resetStory(state: GuildState): void {
+  state.title = null;
+  state.titleSet = false;
+  state.words = [];
+  state.order = [];
+  state.messageId = null;
+  state.ended = false;
+  clearContributions(state.guildId);
+  persist(state);
+}
+
+export interface ContributorStat {
+  userId: string;
+  username: string;
+  avatarUrl: string;
+  wordCount: number;
+}
+
+export function getContributors(guildId: string): ContributorStat[] {
+  return loadContributions(guildId).map((row) => ({
+    userId: row.user_id,
+    username: row.username,
+    avatarUrl: row.avatar_url,
+    wordCount: row.word_count,
+  }));
 }
