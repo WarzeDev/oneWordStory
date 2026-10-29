@@ -8,6 +8,12 @@ When the story is done, any contributor can run `/endstory` and the whole story 
 
 ---
 
+## 📣 Bot Invite
+Invite the bot to your server:
+> https://discord.com/oauth2/authorize?client_id=1564837963077128272
+
+![One Word Story Thumbnail](md/preview.png)
+
 ## ✨ Features
 
 - **One word per message.** Multi-word messages are rejected with a self-deleting notice.
