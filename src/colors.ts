@@ -34,3 +34,44 @@ export function pastelFor(seed: string): string {
   const light = 74 + ((h >>> 17) % 10); // 74 – 83 %
   return hslToHex(hue, sat, light);
 }
+/** Minimum HSL lightness (0–100) for colors drawn on the dark story background. */
+const MIN_LIGHTNESS = 72;
+
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const l = (max + min) / 2;
+  const d = max - min;
+
+  if (d === 0) return [0, 0, l * 100]; // grey
+
+  const s = d / (1 - Math.abs(2 * l - 1));
+  let h: number;
+  if (max === rn) h = ((gn - bn) / d) % 6;
+  else if (max === gn) h = (bn - rn) / d + 2;
+  else h = (rn - gn) / d + 4;
+
+  return [(h * 60 + 360) % 360, s * 100, l * 100];
+}
+
+/**
+ * Takes a Discord role color (24-bit integer) and returns a hex color that is
+ * readable on a dark background: hue is preserved, lightness is raised to at
+ * least MIN_LIGHTNESS, and very washed-out colors get a little saturation back.
+ */
+export function brightenRoleColor(colorInt: number): string {
+  const r = (colorInt >> 16) & 0xff;
+  const g = (colorInt >> 8) & 0xff;
+  const b = colorInt & 0xff;
+
+  const [h, s, l] = rgbToHsl(r, g, b);
+  const lightness = Math.max(l, MIN_LIGHTNESS);
+  // Pure greys stay grey; anything else keeps its saturation (min 45%) so
+  // brightening doesn't turn it into a flat white.
+  const saturation = s === 0 ? 0 : Math.max(s, 45);
+
+  return hslToHex(h, saturation, lightness);
+}

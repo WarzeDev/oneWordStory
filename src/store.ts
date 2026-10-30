@@ -28,7 +28,7 @@ export interface GuildState {
   words: StoryWord[];
   order: string[];
   ended: boolean;
-  /** Per-user pastel color, assigned lazily (in-memory only — colors are stable). */
+  /** Per-user role color (brightened for dark backgrounds). In-memory only; refreshed from Discord. */
   colors: Map<string, string>;
   /** True once a user has set the title for the current story. */
   titleSet: boolean;
@@ -97,13 +97,22 @@ export function forget(guildId: string): void {
   deleteGuild(guildId);
 }
 
+/**
+ * The user's role color if we have one, otherwise the seeded pastel
+ * (used for users without a colored role, or who have left the server).
+ */
 export function colorFor(state: GuildState, userId: string): string {
-  let color = state.colors.get(userId);
-  if (!color) {
-    color = pastelFor(userId);
-    state.colors.set(userId, color);
-  }
-  return color;
+  return state.colors.get(userId) ?? pastelFor(userId);
+}
+
+/** Sets (or clears, with null) the role color for a user. */
+export function setColor(
+  state: GuildState,
+  userId: string,
+  color: string | null,
+): void {
+  if (color) state.colors.set(userId, color);
+  else state.colors.delete(userId);
 }
 
 /**

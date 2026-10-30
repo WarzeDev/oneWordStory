@@ -7,10 +7,12 @@ import {
   MessageFlags,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  type GuildMember,
   type Message,
   type TextChannel,
 } from "discord.js";
 
+import { brightenRoleColor } from "./colors";
 import {
   canContribute,
   colorFor,
@@ -20,6 +22,7 @@ import {
   persist,
   recordWord,
   resetStory,
+  setColor,
   setTitle,
   type GuildState,
   type StoryWord,
@@ -44,6 +47,10 @@ const WORD_COOLDOWN_MS = 3_000; // 3 seconds cooldown
 
 // Track the last word timestamp per guild in memory (or store it in GuildState if supported)
 const lastWordTimestamps = new Map<string, number>();
+
+// How long a user's role color is trusted before it is re-fetched from Discord.
+const COLOR_TTL_MS = 10 * 60_000;
+const colorCheckedAt = new Map<string, number>();
 
 /* ------------------------------------------------------------------ */
 /* Client                                                              */
@@ -112,6 +119,46 @@ function enqueue(guildId: string, task: () => Promise<void>): void {
 /* Rendering helpers                                                   */
 /* ------------------------------------------------------------------ */
 
+/** Brightened color of the member's highest role that has a color, or null. */
+function roleColorOf(member: GuildMember): string | null {
+  const color = member.roles.color?.color; // highest colored role; 0/undefined = none
+  return color ? brightenRoleColor(color) : null;
+}
+
+function applyMemberColor(guildState: GuildState, member: GuildMember): void {
+  setColor(guildState, member.id, roleColorOf(member));
+  colorCheckedAt.set(`${guildState.guildId}:${member.id}`, Date.now());
+}
+
+/** Makes sure role colors are fresh for the given users before rendering. */
+async function refreshColors(
+  guildState: GuildState,
+  userIds: string[],
+): Promise<void> {
+  const guild = client.guilds.cache.get(guildState.guildId);
+  if (!guild) return;
+
+  const now = Date.now();
+  await Promise.all(
+    [...new Set(userIds)].map(async (id) => {
+      const key = `${guildState.guildId}:${id}`;
+      if (now - (colorCheckedAt.get(key) ?? 0) < COLOR_TTL_MS) return;
+      colorCheckedAt.set(key, now);
+      const member = await guild.members
+        .fetch({ user: id, force: true })
+        .catch(() => null);
+      // Members who left keep whatever color they had (or the pastel fallback).
+      if (member) setColor(guildState, id, roleColorOf(member));
+    }),
+  );
+}
+
+function storyUserIds(guildState: GuildState): string[] {
+  const ids = guildState.words.map((w) => w.userId);
+  if (guildState.title) ids.push(guildState.title.authorId);
+  return ids;
+}
+
 function toRenderWords(guildState: GuildState): RenderWord[] {
   return guildState.words.map((word) => ({
     text: word.text,
@@ -151,6 +198,8 @@ async function updateStoryMessage(guildState: GuildState): Promise<void> {
   const channel = await resolveStoryChannel(guildState);
   if (!channel) return;
 
+  await refreshColors(guildState, storyUserIds(guildState));
+
   const buffer = await renderStoryImage(
     toRenderTitle(guildState),
     toRenderWords(guildState),
@@ -188,6 +237,11 @@ async function announceTitlePrompt(channel: TextChannel): Promise<void> {
 async function finishStory(guildState: GuildState): Promise<void> {
   const channel = await resolveStoryChannel(guildState);
   if (!channel) return;
+
+  await refreshColors(guildState, [
+    ...storyUserIds(guildState),
+    ...getContributors(guildState.guildId).map((c) => c.userId),
+  ]);
 
   const title = toRenderTitle(guildState);
   const words = toRenderWords(guildState);
@@ -444,6 +498,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
   const raw = message.content.trim();
   const parts = raw.split(/\s+/).filter(Boolean);
   const userId = message.author.id;
+
+  // The message carries fresh member data, so use it for this user's color.
+  if (message.member) applyMemberColor(guildState, message.member);
 
   if (parts.length === 0) {
     await message.delete().catch(() => {});
