@@ -18,12 +18,14 @@ import {
   colorFor,
   forget,
   getContributors,
+  endTitle,
   getState,
   persist,
+  recordTitleWord,
   recordWord,
   resetStory,
   setColor,
-  setTitle,
+  titleText,
   type GuildState,
   type StoryWord,
 } from "./store";
@@ -31,6 +33,7 @@ import {
   renderBookImage,
   renderStoryImage,
   type RenderContributor,
+  type RenderTitle,
   type RenderWord,
 } from "./render";
 
@@ -41,7 +44,7 @@ if (!TOKEN) {
 }
 
 const MAX_WORD_LENGTH = 50;
-const MAX_TITLE_LENGTH = 80;
+const MAX_TITLE_LENGTH = 80; // total characters across all title words
 const NOTICE_TTL_MS = 6_000;
 const WORD_COOLDOWN_MS = 3_000; // 3 seconds cooldown
 
@@ -154,24 +157,32 @@ async function refreshColors(
 }
 
 function storyUserIds(guildState: GuildState): string[] {
-  const ids = guildState.words.map((w) => w.userId);
-  if (guildState.title) ids.push(guildState.title.authorId);
-  return ids;
+  return [
+    ...guildState.titleWords.map((w) => w.userId),
+    ...guildState.words.map((w) => w.userId),
+  ];
 }
 
-function toRenderWords(guildState: GuildState): RenderWord[] {
-  return guildState.words.map((word) => ({
+function toRenderWordList(
+  guildState: GuildState,
+  list: StoryWord[],
+): RenderWord[] {
+  return list.map((word) => ({
     text: word.text,
     color: colorFor(guildState, word.userId),
     avatarUrl: word.avatarUrl,
   }));
 }
 
-function toRenderTitle(guildState: GuildState) {
-  if (!guildState.title) return null;
+function toRenderWords(guildState: GuildState): RenderWord[] {
+  return toRenderWordList(guildState, guildState.words);
+}
+
+function toRenderTitle(guildState: GuildState): RenderTitle | null {
+  if (guildState.titleWords.length === 0) return null;
   return {
-    text: guildState.title.text,
-    avatarUrl: guildState.title.authorAvatar,
+    text: titleText(guildState),
+    words: toRenderWordList(guildState, guildState.titleWords),
   };
 }
 
@@ -206,9 +217,11 @@ async function updateStoryMessage(guildState: GuildState): Promise<void> {
   );
   const attachment = new AttachmentBuilder(buffer, { name: "story.png" });
 
-  const content = guildState.title
+  const content = guildState.titleSet
     ? "Add **one word** at a time!"
-    : "The next message will become the **title** (it may contain **multiple words**)!";
+    : guildState.titleWords.length === 0
+      ? "The next words will form the **title**, **one word** per message. End it with a word ending in `:` or send a lone `:`."
+      : "Keep writing the **title**, **one word** at a time. End it with a word ending in `:` or send a lone `:`.";
 
   if (guildState.messageId) {
     try {
@@ -229,7 +242,7 @@ async function updateStoryMessage(guildState: GuildState): Promise<void> {
 async function announceTitlePrompt(channel: TextChannel): Promise<void> {
   await notify(
     channel,
-    "**A new story begins!** The **next message** in this channel will become the book's **title** - it may contain multiple words. After that, one word per message.",
+    "**A new story begins!** The next words in this channel form the book's **title**, **one word per message**. End the title with a word ending in `:` (like `Dragons:`) or by sending a lone `:` - after that, the story itself begins.",
     15_000,
   );
 }
@@ -261,8 +274,8 @@ async function finishStory(guildState: GuildState): Promise<void> {
   const book = await renderBookImage(title, words, contributors);
   const message = await channel.send({
     content: title
-      ? `**${title.text}** - a new story begins with the next word!`
-      : "**The End** - a new story begins with the next word!",
+      ? `**${title.text}** - the next word starts the title of a new story!`
+      : "**The End** - the next word starts the title of a new story!",
     files: [new AttachmentBuilder(book, { name: "story-book.png" })],
   });
 
@@ -330,8 +343,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             "• `/setchannel <channel>` — choose the story channel\n" +
             "• `/setminusers <num>` — how many *other* users must write before a user can go again (`0` = no restriction)\n\n" +
             "**How to write**\n" +
-            "• The first message in the channel becomes the **title** (it may contain multiple words).\n" +
-            "• After that, **one word per message** with a **3-second cooldown** between words.\n" +
+            "• The story starts with the **title**, written **one word per message**.\n" +
+            "• End the title with a word ending in `:` (like `Dragons:`) or by sending just `:`.\n" +
+            "• After that, the story itself: **one word per message** with a **3-second cooldown** between words.\n" +
             "• Your messages are deleted and folded into the story image.\n\n" +
             "**Finish**\n" +
             "• `/endstory` — anyone who contributed can close the book. The finished book is pinned; the next message starts a new story.",
@@ -422,7 +436,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (guildState.words.length === 0 && !guildState.title) {
+        if (guildState.words.length === 0 && guildState.titleWords.length === 0) {
           await interaction.reply({
             content: "The story is empty.",
             flags: MessageFlags.Ephemeral,
@@ -430,8 +444,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
+        if (!guildState.titleSet) {
+          await interaction.reply({
+            content:
+              "The title isn't finished yet. End it with a word ending in `:` or send a lone `:`, then write the story.",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
         const contributed =
-          guildState.title?.authorId === interaction.user.id ||
+          guildState.titleWords.some((w) => w.userId === interaction.user.id) ||
           guildState.words.some((w) => w.userId === interaction.user.id);
         if (!contributed) {
           await interaction.reply({
@@ -464,7 +487,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await interaction.editReply(
-          "The story has been bound into a book and pinned. The next message will become the **title** of a new story.",
+          "The story has been bound into a book and pinned. The next words will form the **title** of a new story.",
         );
         return;
       }
@@ -483,7 +506,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Word collection (and title capture)                                 */
+/* Word collection (title words, then story words)                     */
 /* ------------------------------------------------------------------ */
 
 client.on(Events.MessageCreate, async (message: Message) => {
@@ -512,30 +535,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
   enqueue(message.guild.id, async () => {
     if (guildState.ended) return;
 
-    // ---- Title phase (No cooldown needed for title) ----
-    if (!guildState.titleSet) {
-      const titleText = raw;
-      if (titleText.length > MAX_TITLE_LENGTH) {
-        await notify(
-          channel,
-          `Titles can be at most ${MAX_TITLE_LENGTH} characters.`,
-        );
-        return;
-      }
-
-      const author = message.author;
-      setTitle(guildState, {
-        text: titleText,
-        authorId: userId,
-        authorName: author.username,
-        authorAvatar: author.displayAvatarURL({ size: 64, extension: "png" }),
-      });
-
-      await updateStoryMessage(guildState);
-      return;
-    }
-
-    // ---- Cooldown Check ----
+    // ---- Cooldown check (title words and story words alike) ----
     const now = Date.now();
     const lastTime = lastWordTimestamps.get(message.guild.id) ?? 0;
     const elapsed = now - lastTime;
@@ -549,7 +549,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
       return;
     }
 
-    // ---- Normal word phase ----
+    // ---- One word only ----
     const isSingleWord = parts.length === 1 && raw.length <= MAX_WORD_LENGTH;
     if (!isSingleWord) {
       await notify(
@@ -561,6 +561,37 @@ client.on(Events.MessageCreate, async (message: Message) => {
       return;
     }
 
+    const token = parts[0]!;
+    const inTitlePhase = !guildState.titleSet;
+
+    // In the title phase, ":" closes the title: either a word ending in ":"
+    // (the colon is dropped from the word) or a lone ":" message.
+    const closesTitle = inTitlePhase && token.endsWith(":");
+    const wordText = inTitlePhase ? token.replace(/:+$/, "") : token;
+    const isBareColon = closesTitle && wordText.length === 0;
+
+    if (isBareColon && guildState.titleWords.length === 0) {
+      await notify(
+        channel,
+        "The title needs at least one word before you can close it with `:`.",
+      );
+      return;
+    }
+
+    if (inTitlePhase && !isBareColon) {
+      const currentLength = titleText(guildState).length;
+      const newLength =
+        currentLength + (currentLength > 0 ? 1 : 0) + wordText.length;
+      if (newLength > MAX_TITLE_LENGTH) {
+        await notify(
+          channel,
+          `Titles can be at most ${MAX_TITLE_LENGTH} characters. Send a lone \`:\` to end the title here.`,
+        );
+        return;
+      }
+    }
+
+    // ---- Fairness rule (applies to title words and the closing ":" too) ----
     if (!canContribute(guildState, userId)) {
       await notify(
         channel,
@@ -574,14 +605,33 @@ client.on(Events.MessageCreate, async (message: Message) => {
     // Update last word timestamp successfully
     lastWordTimestamps.set(message.guild.id, Date.now());
 
+    const avatarUrl = message.author.displayAvatarURL({
+      size: 64,
+      extension: "png",
+    });
+
+    // ---- Title phase ----
+    if (inTitlePhase) {
+      if (!isBareColon) {
+        recordTitleWord(guildState, {
+          text: wordText,
+          userId,
+          username: message.author.username,
+          avatarUrl,
+        });
+      }
+      if (closesTitle) endTitle(guildState);
+
+      await updateStoryMessage(guildState);
+      return;
+    }
+
+    // ---- Story phase ----
     const word: StoryWord = {
-      text: parts[0]!,
+      text: token,
       userId,
       username: message.author.username,
-      avatarUrl: message.author.displayAvatarURL({
-        size: 64,
-        extension: "png",
-      }),
+      avatarUrl,
     };
     recordWord(guildState, word);
 

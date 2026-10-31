@@ -2,7 +2,7 @@
 
 A Discord bot (built with [Bun](https://bun.sh) + [discord.js](https://discord.js.org) + [@napi-rs/canvas](https://github.com/Brooooooklyn/canvas)) that turns a channel into a collaborative storybook.
 
-Users each contribute **one word at a time**. Their messages are deleted and folded into a single bot message containing a freshly rendered image of the story so far — every word sitting beneath a small circular avatar and painted in a pastel color unique to its author.
+Users each contribute **one word at a time** — first the **title**, then the story itself. Their messages are deleted and folded into a single bot message containing a freshly rendered image of the story so far — every word sitting beneath a small circular avatar and painted in a pastel color unique to its author.
 
 When the story is done, any contributor can run `/endstory` and the whole story is re-rendered in plain ink across an open book — no avatars, no colors.
 
@@ -17,11 +17,12 @@ Invite the bot to your server:
 ## ✨ Features
 
 - **One word per message.** Multi-word messages are rejected with a self-deleting notice.
+- **Word-by-word titles.** The title is written one word at a time, too, and closed with a colon (`:`). Every title word sits under its author's avatar.
 - **Live-rendered story card.** Every contribution re-renders the story as a PNG.
 - **Per-user identity.** Each author gets
   - a deterministic pastel color (stable across restarts), and
   - their avatar shown as a small circle directly above each of their words.
-- **Fairness rule.** Admins can require that N *other* users write before a user may go again (prevents one person from writing the whole story).
+- **Fairness rule.** Admins can require that N *other* users write before a user may go again (prevents one person from writing the whole title or story).
 - **Auto-cleanup.** User messages are deleted; the channel stays a clean canvas.
 - **Book finale.** `/endstory` (any contributor) renders the finished story on an open book in plain serif ink.
 
@@ -29,17 +30,23 @@ Invite the bot to your server:
 
 ## 📜 How it works
 
-1. An admin runs `/setchannel #story`. The bot posts a hint that the **next message will become the title**.
-2. The first person to post in the channel sets the **title** — it may contain multiple words. Their avatar appears next to the title on the live card.
-3. Everyone keeps adding **one word per message**. The card updates in place each time.
-4. Any user who has contributed (title author included) can run `/endstory`. The live card is replaced by the finished book, which is **pinned** to the channel. The contributor bar at the bottom of the book shows each author's avatar, pastel color, and share of the words.
+1. An admin runs `/setchannel #story`. The bot posts a hint that the **next words will form the title**.
+2. Users write the **title one word per message**. Each title word appears on the live card in large letters with its author's avatar above it.
+3. The title is closed with a colon (see below). From then on, everyone adds **one word per message** to the story itself. The card updates in place each time.
+4. Any user who has contributed (title words included) can run `/endstory` once the title is closed. The live card is replaced by the finished book, which is **pinned** to the channel. The contributor bar at the bottom of the book shows each author's avatar, pastel color, and share of the words.
 5. The next message in the channel starts a **new story** — beginning with a fresh title.
 
 ### The title
 
-- The **very first message** in the story channel becomes the title of the book. It may be several words (up to 80 characters) — punctuation counts.
-- The title author's avatar appears next to the title on the live story card. In the finished book, the title is rendered in large serif letters at the top with no avatar.
-- The title counts as a contribution for the `/endstory` rule and shows up in the contributor bar.
+- The **first messages** in the story channel are the title, written **one word per message** (just like the story).
+- **Closing the title:** a title ends when
+  - a word **ends in a colon** — e.g. `Dragons:` adds the word *Dragons* and closes the title (the colon itself is not shown), **or**
+  - someone sends a **lone `:`** as a standalone message, which closes the title without adding a word.
+- A title needs at least one word before it can be closed, and may be at most 80 characters in total (spaces included). If the next word wouldn't fit, send a lone `:` to end it.
+- Everything written after the title is closed is the story itself, and colons are ordinary characters again.
+- Title words follow the same rules as story words: one word per message, the 3-second cooldown, and the "min users" rule (below). They also count as contributions for `/endstory` and the contributor bar.
+- On the live card every title word has its author's avatar **above** it (in cream lettering, separated from the story by a divider). On the finished book the title is rendered in large serif letters at the top of the first page with no avatars.
+- Stories whose title was set before this update (a single multi-word message) keep working: the old title is split into words, shown with the same avatar-above-word layout, and treated as already closed.
 
 ### The "min users" rule
 
@@ -51,7 +58,7 @@ Invite the bot to your server:
 | `1` | At least one other person must go between your words. |
 | `2` | At least two different people must go between your words. |
 
-The very first word of a story is always allowed.
+This applies to title words and to the closing `:` as well. The very first word of a story is always allowed.
 
 ---
 
@@ -123,7 +130,7 @@ On first launch the bot registers its slash commands globally (may take a few mi
 |---------|-----|-------------|
 | `/setchannel <channel>` | Manage Server | Sets the channel where the story is written. |
 | `/setminusers <num>` | Manage Server | Number of *other* users who must write before a user can write again (`0`–`50`). |
-| `/endstory` | Any contributor | Ends the story and renders it on a book. |
+| `/endstory` | Any contributor | Ends the story and renders it on a book (the title must be closed first). |
 
 Admins are determined by the **Manage Server** permission. Slash commands are also hidden from non-admins via `setDefaultMemberPermissions`.
 
@@ -134,7 +141,8 @@ Admins are determined by the **Manage Server** permission. Slash commands are al
 ### Live story card
 
 - 900 px wide, height grows with content.
-- Each word is a "block": a 44 px circular avatar on top, the word underneath.
+- Each word — title words and story words alike — is a "block": a 44 px circular avatar on top, the word underneath.
+- Title blocks use larger cream lettering and sit above a thin divider; story blocks are smaller and colored.
 - Blocks wrap left-to-right, top-to-bottom.
 - Word color = the author's pastel color (deterministic `fnv1a(userId)` → HSL → hex).
 - Avatar has a matching colored ring.
@@ -153,9 +161,10 @@ Admins are determined by the **Manage Server** permission. Slash commands are al
 
 ```
 src/
-├── index.ts     Discord client, slash commands, message handling, render queue
+├── index.ts     Discord client, slash commands, message handling (title + story words), render queue
 ├── render.ts    Canvas rendering (live card + finished book)
-├── store.ts     In-memory per-guild state and the fairness rule
+├── store.ts     Per-guild state (cached, persisted via db.ts) and the fairness rule
+├── db.ts        SQLite persistence (bun:sqlite) + schema migrations
 └── colors.ts    Deterministic pastel color generation
 ```
 
@@ -163,7 +172,7 @@ src/
 
 ## ⚠️ Notes & limitations
 
-- **State is in-memory.** Restarting the bot clears the story, settings, and the link to the story message (a new card is posted on the next word). For persistence, back `store.ts` with SQLite (`bun:sqlite`) or Redis.
+- **State is persisted** in a local SQLite file (`story.db`, created next to where the bot runs). Settings, the title (words and whether it's closed), the story, and the story-message link survive restarts. Databases created before word-by-word titles are upgraded automatically on startup (two columns are added; existing titles are read as closed titles).
 - **One story per guild.** After `/endstory`, the story is closed; restart the bot to start a new one.
 - **Avatars are cached forever** per URL. Discord changes the URL when a user changes their avatar, so this is safe.
 - **Fonts:** on bare Linux images (e.g. `node:alpine`), install `fontconfig` and `ttf-dejavu` or text will render as blank boxes.
@@ -175,6 +184,7 @@ src/
 
 | Symptom | Fix |
 |--------|-----|
+| The title never ends | Send a word ending in `:` (e.g. `Dragons:`) or a lone `:`. `/endstory` is unavailable until the title is closed. |
 | Slash commands don't appear | Wait a few minutes (global commands), or re-invite with the `applications.commands` scope. |
 | "This interaction failed" | Check the bot console — usually a missing permission (Attach Files / Send Messages). |
 | User messages aren't deleted | Give the bot **Manage Messages** and move its role above the users'. |

@@ -12,8 +12,10 @@ export interface RenderWord {
 }
 
 export interface RenderTitle {
+  /** The whole title as plain text (used on the finished book). */
   text: string;
-  avatarUrl: string;
+  /** One entry per title word, each with its own author avatar. */
+  words: RenderWord[];
 }
 
 export interface RenderContributor {
@@ -126,64 +128,55 @@ function drawAvatar(
 const IMG_W = 900;
 const PAD = 40;
 const GAP = 10;
-const AVATAR = 44;
 const AVATAR_GAP = 10;
-const FONT_SIZE = 30;
-const TEXT_H = Math.round(FONT_SIZE * 1.3);
-const ROW_H = AVATAR + AVATAR_GAP + TEXT_H;
 const ROW_GAP = 18;
-const FONT = `600 ${FONT_SIZE}px sans-serif`;
 
-const TITLE_FONT_SIZE = 40;
-const TITLE_AVATAR = 44;
-const TITLE_ROW_H = 60;
+interface BlockStyle {
+  avatar: number;
+  font: string;
+  textH: number;
+  /** Fixed text color; falls back to each word's own color. */
+  textColor?: string;
+}
+
+const WORD_STYLE: BlockStyle = {
+  avatar: 44,
+  font: `600 30px sans-serif`,
+  textH: Math.round(30 * 1.3),
+};
+
+const TITLE_STYLE: BlockStyle = {
+  avatar: 44,
+  font: `700 40px sans-serif`,
+  textH: Math.round(40 * 1.3),
+  textColor: "#f4f0e6",
+};
+
 const TITLE_GAP = 26;
 
-/**
- * Renders the live story card: optional large title (with author avatar),
- * then words each sitting under a small circular avatar, painted in that
- * user's pastel color.
- */
-export async function renderStoryImage(
-  title: RenderTitle | null,
+const rowHeight = (style: BlockStyle) =>
+  style.avatar + AVATAR_GAP + style.textH;
+
+interface Block {
+  word: RenderWord;
+  width: number;
+}
+
+/** Flows words (avatar on top, text below) left-to-right into wrapped rows. */
+function layoutBlocks(
+  measure: SKRSContext2D,
   words: RenderWord[],
-): Promise<Buffer> {
-  const measure = createCanvas(1, 1).getContext("2d");
-
-  // --- title layout ---
-  const titleFont = `700 ${TITLE_FONT_SIZE}px sans-serif`;
-  measure.font = titleFont;
-
-  const titleText = title?.text ?? null;
-  const titleTextWidth = titleText
-    ? Math.ceil(measure.measureText(titleText).width)
-    : 0;
-  const titleTotalW = titleText
-    ? titleTextWidth + 14 + TITLE_AVATAR
-    : 0;
-
-  // Wrap the title if it's absurdly long; treat it as one line otherwise.
-  const titleLines: string[] = [];
-  if (titleText) {
-    const maxTitleW = IMG_W - PAD * 2 - TITLE_AVATAR - 14;
-    measure.font = titleFont;
-    if (titleTextWidth <= maxTitleW) {
-      titleLines.push(titleText);
-    } else {
-      titleLines.push(...wrapLines(measure, titleText, maxTitleW));
-    }
-  }
-
-  // --- word layout ---
-  measure.font = FONT;
-  const blocks = words.map((word) => {
+  style: BlockStyle,
+): Block[][] {
+  measure.font = style.font;
+  const blocks: Block[] = words.map((word) => {
     const textWidth = Math.ceil(measure.measureText(word.text).width);
-    return { word, width: Math.max(AVATAR, textWidth) + 10 };
+    return { word, width: Math.max(style.avatar, textWidth) + 10 };
   });
 
   const maxRowWidth = IMG_W - PAD * 2;
-  const rows: (typeof blocks)[] = [];
-  let row: typeof blocks = [];
+  const rows: Block[][] = [];
+  let row: Block[] = [];
   let rowWidth = 0;
 
   for (const block of blocks) {
@@ -198,16 +191,72 @@ export async function renderStoryImage(
     }
   }
   if (row.length) rows.push(row);
+  return rows;
+}
+
+/** Total height of laid-out rows (no trailing gap). */
+function rowsHeight(rows: Block[][], style: BlockStyle): number {
+  return rows.length > 0
+    ? rows.length * rowHeight(style) + (rows.length - 1) * ROW_GAP
+    : 0;
+}
+
+/** Draws rows starting at `y`; returns the y after the last row (incl. gap). */
+function drawRows(
+  ctx: SKRSContext2D,
+  rows: Block[][],
+  avatars: Map<string, Image | null>,
+  startY: number,
+  style: BlockStyle,
+): number {
+  let y = startY;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+
+  for (const currentRow of rows) {
+    let x = PAD;
+    for (const block of currentRow) {
+      const { word } = block;
+      const cx = x + block.width / 2;
+      const cy = y + style.avatar / 2;
+
+      drawAvatar(
+        ctx,
+        avatars.get(word.avatarUrl) ?? null,
+        cx,
+        cy,
+        style.avatar / 2,
+        word.color,
+      );
+
+      ctx.fillStyle = style.textColor ?? word.color;
+      ctx.font = style.font;
+      ctx.fillText(word.text, cx, y + style.avatar + AVATAR_GAP);
+
+      x += block.width + GAP;
+    }
+    y += rowHeight(style) + ROW_GAP;
+  }
+  return y;
+}
+
+/**
+ * Renders the live story card: an optional title (every title word sits under
+ * its author's avatar, in large cream letters), a divider, then the story
+ * words, each under a small circular avatar and painted in that user's color.
+ */
+export async function renderStoryImage(
+  title: RenderTitle | null,
+  words: RenderWord[],
+): Promise<Buffer> {
+  const measure = createCanvas(1, 1).getContext("2d");
+
+  const titleRows = title ? layoutBlocks(measure, title.words, TITLE_STYLE) : [];
+  const bodyRows = layoutBlocks(measure, words, WORD_STYLE);
 
   const titleH =
-    titleLines.length > 0
-      ? titleLines.length * TITLE_ROW_H + TITLE_GAP
-      : 0;
-
-  const bodyH =
-    rows.length > 0
-      ? rows.length * ROW_H + Math.max(0, rows.length - 1) * ROW_GAP
-      : 0;
+    titleRows.length > 0 ? rowsHeight(titleRows, TITLE_STYLE) + TITLE_GAP : 0;
+  const bodyH = rowsHeight(bodyRows, WORD_STYLE);
 
   const imgH = Math.max(200, PAD * 2 + titleH + bodyH);
 
@@ -221,7 +270,7 @@ export async function renderStoryImage(
   // Preload avatars in parallel
   const uniqueUrls = new Set<string>();
   for (const w of words) uniqueUrls.add(w.avatarUrl);
-  if (title) uniqueUrls.add(title.avatarUrl);
+  if (title) for (const w of title.words) uniqueUrls.add(w.avatarUrl);
   const loaded = await Promise.all(
     [...uniqueUrls].map(async (u) => [u, await getAvatar(u)] as const),
   );
@@ -229,43 +278,9 @@ export async function renderStoryImage(
 
   let y = PAD;
 
-  // --- draw title (if any) ---
-  if (title && titleLines.length > 0) {
-    ctx.textAlign = "left";
-    ctx.textBaseline = "middle";
-    ctx.font = titleFont;
-    ctx.fillStyle = "#f4f0e6";
-
-    let ty = y + TITLE_ROW_H / 2;
-    for (const line of titleLines) {
-      ctx.fillText(line, PAD, ty);
-      ty += TITLE_ROW_H;
-    }
-
-    // Author avatar to the right of the (last) title line
-    const lastLineWidth = Math.ceil(
-      measure.measureText(titleLines[titleLines.length - 1]!).width,
-    );
-    // Note: measure was left on FONT above; re-measure with titleFont.
-    ctx.font = titleFont;
-    const actualLastWidth = Math.ceil(
-      ctx.measureText(titleLines[titleLines.length - 1]!).width,
-    );
-    void lastLineWidth;
-
-    const avatarCx = PAD + actualLastWidth + 14 + TITLE_AVATAR / 2;
-    const avatarCy =
-      y + (titleLines.length - 1) * TITLE_ROW_H + TITLE_ROW_H / 2;
-
-    drawAvatar(
-      ctx,
-      avatars.get(title.avatarUrl) ?? null,
-      avatarCx,
-      avatarCy,
-      TITLE_AVATAR / 2,
-      "#8a8f98",
-    );
-
+  // --- title (avatar above every word) ---
+  if (titleRows.length > 0) {
+    drawRows(ctx, titleRows, avatars, y, TITLE_STYLE);
     y += titleH;
 
     // Divider
@@ -277,33 +292,8 @@ export async function renderStoryImage(
     ctx.stroke();
   }
 
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-
-  for (const currentRow of rows) {
-    let x = PAD;
-    for (const block of currentRow) {
-      const { word } = block;
-      const cx = x + block.width / 2;
-      const cy = y + AVATAR / 2;
-
-      drawAvatar(
-        ctx,
-        avatars.get(word.avatarUrl) ?? null,
-        cx,
-        cy,
-        AVATAR / 2,
-        word.color,
-      );
-
-      ctx.fillStyle = word.color;
-      ctx.font = FONT;
-      ctx.fillText(word.text, cx, y + AVATAR + AVATAR_GAP);
-
-      x += block.width + GAP;
-    }
-    y += ROW_H + ROW_GAP;
-  }
+  // --- story words ---
+  drawRows(ctx, bodyRows, avatars, y, WORD_STYLE);
 
   return canvas.toBuffer("image/png");
 }

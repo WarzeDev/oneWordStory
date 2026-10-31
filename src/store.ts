@@ -12,54 +12,75 @@ import {
 
 export type StoryWord = StoredWord;
 
-export interface TitleInfo {
-  text: string;
-  authorId: string;
-  authorName: string;
-  authorAvatar: string;
-}
-
 export interface GuildState {
   guildId: string;
   channelId: string | null;
   messageId: string | null;
   minUsers: number;
-  title: TitleInfo | null;
+  /** The title, one word per entry (each with its own author). Empty until the first title word. */
+  titleWords: StoryWord[];
   words: StoryWord[];
   order: string[];
   ended: boolean;
   /** Per-user role color (brightened for dark backgrounds). In-memory only; refreshed from Discord. */
   colors: Map<string, string>;
-  /** True once a user has set the title for the current story. */
+  /** True once the title has been closed (word ending in ":" or a lone ":"). */
   titleSet: boolean;
 }
 
 const cache = new Map<string, GuildState>();
 
+/** The title as plain text (words joined with spaces). */
+export function titleText(state: GuildState): string {
+  return state.titleWords.map((w) => w.text).join(" ");
+}
+
+function parseWords(json: string | null | undefined): StoryWord[] {
+  try {
+    const parsed = JSON.parse(json || "[]");
+    return Array.isArray(parsed) ? (parsed as StoryWord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 function fromRow(row: GuildRow): GuildState {
   const words = JSON.parse(row.words) as StoryWord[];
   const order = JSON.parse(row.order) as string[];
-  const title: TitleInfo | null =
-    row.title && row.title_author_id && row.title_author_name && row.title_author_avatar
-      ? {
-          text: row.title,
-          authorId: row.title_author_id,
-          authorName: row.title_author_name,
-          authorAvatar: row.title_author_avatar,
-        }
-      : null;
+
+  let titleWords = parseWords(row.title_words);
+  let titleSet = row.title_done === 1;
+
+  // Legacy rows: the title was a single multi-word message by one author and
+  // was only ever stored once finished. Split it into per-word entries so it
+  // renders like a new-style title, and treat it as already closed.
+  if (titleWords.length === 0 && row.title) {
+    const authorId = row.title_author_id ?? "";
+    const authorName = row.title_author_name ?? "";
+    const authorAvatar = row.title_author_avatar ?? "";
+    titleWords = row.title
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((text) => ({
+        text,
+        userId: authorId,
+        username: authorName,
+        avatarUrl: authorAvatar,
+      }));
+    titleSet = titleWords.length > 0;
+  }
 
   return {
     guildId: row.guild_id,
     channelId: row.channel_id,
     messageId: row.message_id,
     minUsers: row.min_users,
-    title,
+    titleWords,
     words,
     order,
     ended: row.ended === 1,
     colors: new Map(),
-    titleSet: title !== null,
+    titleSet,
   };
 }
 
@@ -69,10 +90,14 @@ function toRow(state: GuildState): GuildRow {
     channel_id: state.channelId,
     message_id: state.messageId,
     min_users: state.minUsers,
-    title: state.title?.text ?? null,
-    title_author_id: state.title?.authorId ?? null,
-    title_author_name: state.title?.authorName ?? null,
-    title_author_avatar: state.title?.authorAvatar ?? null,
+    // Legacy columns are kept in sync (joined text + first author) so the
+    // data stays readable by older versions of the bot.
+    title: state.titleWords.length ? titleText(state) : null,
+    title_author_id: state.titleWords[0]?.userId ?? null,
+    title_author_name: state.titleWords[0]?.username ?? null,
+    title_author_avatar: state.titleWords[0]?.avatarUrl ?? null,
+    title_words: JSON.stringify(state.titleWords),
+    title_done: state.titleSet ? 1 : 0,
     words: JSON.stringify(state.words),
     order: JSON.stringify(state.order),
     ended: state.ended ? 1 : 0,
@@ -119,8 +144,8 @@ export function setColor(
  * A user may contribute when at least `minUsers` *distinct other* users have
  * written a word since their own last word.
  *
- * The title counts as a contribution for the purpose of the fairness rule:
- * once the title is set, the title author is in `order` as well.
+ * Title words count as contributions for the fairness rule: every title
+ * word's author is in `order`, just like story words.
  */
 export function canContribute(state: GuildState, userId: string): boolean {
   if (state.order.length === 0) return true;
@@ -151,22 +176,30 @@ export function recordWord(
   persist(state);
 }
 
-export function setTitle(state: GuildState, title: TitleInfo): void {
-  state.title = title;
-  state.titleSet = true;
-  // Title author counts as a contributor for the fairness rule and the bar.
-  state.order.push(title.authorId);
+/**
+ * Adds one word to the title. Title words count as contributions for the
+ * fairness rule and the contributor bar, exactly like story words.
+ */
+export function recordTitleWord(state: GuildState, word: StoryWord): void {
+  state.titleWords.push(word);
+  state.order.push(word.userId);
   incrementContribution(
     state.guildId,
-    title.authorId,
-    title.authorName,
-    title.authorAvatar,
+    word.userId,
+    word.username,
+    word.avatarUrl,
   );
   persist(state);
 }
 
+/** Closes the title; everything written afterwards is the story itself. */
+export function endTitle(state: GuildState): void {
+  state.titleSet = true;
+  persist(state);
+}
+
 export function resetStory(state: GuildState): void {
-  state.title = null;
+  state.titleWords = [];
   state.titleSet = false;
   state.words = [];
   state.order = [];

@@ -29,6 +29,14 @@ export interface GuildRow {
   title_author_id: string | null;
   title_author_name: string | null;
   title_author_avatar: string | null;
+  /**
+   * JSON-encoded StoredWord[] holding the title, one entry per word.
+   * Empty ("[]") on rows written before titles became word-by-word; those
+   * rows are upgraded on load from the legacy `title*` columns above.
+   */
+  title_words: string;
+  /** 1 once the title has been closed (word ending in ":" or a lone ":"). */
+  title_done: number;
   /** JSON-encoded StoredWord[]. */
   words: string;
   /** JSON-encoded string[]. */
@@ -59,6 +67,8 @@ db.exec(`
     title_author_id     TEXT,
     title_author_name   TEXT,
     title_author_avatar TEXT,
+    title_words         TEXT NOT NULL DEFAULT '[]',
+    title_done          INTEGER NOT NULL DEFAULT 0,
     words               TEXT NOT NULL DEFAULT '[]',
     "order"             TEXT NOT NULL DEFAULT '[]',
     ended               INTEGER NOT NULL DEFAULT 0
@@ -73,6 +83,22 @@ db.exec(`
     PRIMARY KEY (guild_id, user_id)
   );
 `);
+
+/* ------------------------------------------------------------------ */
+/* Migrations (databases created before word-by-word titles)           */
+/* ------------------------------------------------------------------ */
+
+function ensureColumn(table: string, column: string, ddl: string): void {
+  const columns = db.query(`PRAGMA table_info(${table})`).all() as {
+    name: string;
+  }[];
+  if (!columns.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
+}
+
+ensureColumn("guilds", "title_words", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("guilds", "title_done", "INTEGER NOT NULL DEFAULT 0");
 
 /* ------------------------------------------------------------------ */
 /* Guilds                                                              */
@@ -96,6 +122,7 @@ export function saveGuild(row: GuildRow): void {
     `UPDATE guilds SET
        channel_id = ?, message_id = ?, min_users = ?,
        title = ?, title_author_id = ?, title_author_name = ?, title_author_avatar = ?,
+       title_words = ?, title_done = ?,
        words = ?, "order" = ?, ended = ?
      WHERE guild_id = ?`,
   ).run(
@@ -106,6 +133,8 @@ export function saveGuild(row: GuildRow): void {
     row.title_author_id,
     row.title_author_name,
     row.title_author_avatar,
+    row.title_words,
+    row.title_done,
     row.words,
     row.order,
     row.ended,
