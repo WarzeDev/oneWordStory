@@ -340,15 +340,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
             "**📖 book.Warze.org**\n" +
             "A collaborative story written one word per message.\n\n" +
             "**Admin setup**\n" +
-            "• `/setchannel <channel>` — choose the story channel\n" +
-            "• `/setminusers <num>` — how many *other* users must write before a user can go again (`0` = no restriction)\n\n" +
+            "• `/setchannel <channel>` - choose the story channel\n" +
+            "• `/setminusers <num>` - how many *other* users must write before a user can go again (`0` = no restriction)\n\n" +
             "**How to write**\n" +
             "• The story starts with the **title**, written **one word per message**.\n" +
             "• End the title with a word ending in `:` (like `Dragons:`) or by sending just `:`.\n" +
             "• After that, the story itself: **one word per message** with a **3-second cooldown** between words.\n" +
             "• Your messages are deleted and folded into the story image.\n\n" +
             "**Finish**\n" +
-            "• `/endstory` — anyone who contributed can close the book. The finished book is pinned; the next message starts a new story.",
+            "• `/endstory` - anyone who contributed can close the book. The finished book is pinned; the next message starts a new story.",
         });
         return;
       }
@@ -369,7 +369,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({
           content:
             num === 0
-              ? "✅ Minimum users set to **0** — users can now write back-to-back."
+              ? "✅ Minimum users set to **0** - users can now write back-to-back."
               : `✅ Each user must wait for **${num}** other user${
                   num === 1 ? "" : "s"
                 } to write before adding another word.`,
